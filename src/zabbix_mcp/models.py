@@ -45,12 +45,6 @@ class ZabbixConfig(BaseModel):
         False,
         description="Enable per-request authentication via HTTP headers (requires HTTP/SSE transport)",
     )
-    passthrough_cache_size: int = Field(
-        50, description="Max cached Zabbix sessions for passthrough mode"
-    )
-    passthrough_cache_ttl: int = Field(
-        300, description="Cache TTL in seconds for passthrough sessions"
-    )
     # Tool search transform
     tool_search_enabled: bool = Field(
         False, description="Enable FastMCP tool-search transform (true/false)"

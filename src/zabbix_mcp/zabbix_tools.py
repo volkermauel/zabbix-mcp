@@ -17,31 +17,8 @@ from zabbix_utils.exceptions import ProcessingError
 from zabbix_mcp.models import ZabbixConfig
 from zabbix_mcp.zabbix_client import ZabbixClient
 from zabbix_mcp.zabbix_client import extract_zabbix_config_from_request
-from zabbix_mcp.zabbix_client import get_passthrough_cache
 
 logger = logging.getLogger(__name__)
-
-_AUTH_ERROR_CODES = {-32602, -32500}
-_SESSION_ERROR_SUBSTRINGS = (
-    "session expired",
-    "session is closed",
-    "not authenticated",
-    "not authorized",
-    "session terminated",
-    "re-login",
-)
-
-
-def _is_auth_error(exc: Exception) -> bool:
-    if not isinstance(exc, APIRequestError):
-        return False
-    err = exc.args[0] if exc.args else {}
-    if not isinstance(err, dict):
-        return False
-    if err.get("code", 0) in _AUTH_ERROR_CODES:
-        return True
-    combined = (str(err.get("message", "")) + " " + str(err.get("data", ""))).lower()
-    return any(s in combined for s in _SESSION_ERROR_SUBSTRINGS)
 
 
 def format_error(exc: Exception) -> dict:
@@ -87,36 +64,12 @@ def register_tools(mcp, config: ZabbixConfig):
                     passthrough_config.zabbix_url != config.zabbix_url
                     or passthrough_config.token != config.token
                 ):
-                    cache = get_passthrough_cache(config)
-                    api = await cache.get_or_create(passthrough_config)
-                    return _PassthroughApi(api, cache, passthrough_config)
+                    return ZabbixClient(passthrough_config)
             except Exception:
                 logger.warning(
                     "Failed to create passthrough session, falling back to default config"
                 )
         return ZabbixClient(config)
-
-    class _PassthroughApi:
-        """Context manager wrapper for cached passthrough API sessions."""
-
-        def __init__(self, api, cache=None, config=None):
-            self._api = api
-            self._cache = cache
-            self._config = config
-
-        async def __aenter__(self):
-            return self._api
-
-        async def __aexit__(self, exc_type, exc_val, exc_tb):
-            if (
-                exc_val is not None
-                and _is_auth_error(exc_val)
-                and self._cache is not None
-                and self._config is not None
-            ):
-                logger.info("Auth error detected, invalidating passthrough cache entry")
-                await self._cache.invalidate(self._config)
-            return False
 
     ##########################
     # API Info Tools

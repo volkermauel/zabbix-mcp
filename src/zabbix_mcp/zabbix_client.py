@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import time
 from typing import Any
 
 from zabbix_utils import AsyncZabbixAPI
@@ -77,105 +76,6 @@ class ZabbixClient:
         return self._task_apis.get(key, self._api)
 
 
-class PassthroughClientCache:
-    """LRU cache for Zabbix API sessions keyed by (url, token/user)."""
-
-    def __init__(self, max_size: int = 50, ttl: int = 300):
-        self._cache: dict[tuple[str, ...], tuple[float, Any]] = {}
-        self._max_size = max_size
-        self._ttl = ttl
-        self._lock = asyncio.Lock()
-
-    def _cache_key(self, config: ZabbixConfig) -> tuple[str, ...]:
-        return (
-            config.zabbix_url,
-            config.token or "",
-            config.user or "",
-            config.password or "",
-        )
-
-    async def get_or_create(self, config: ZabbixConfig) -> Any:
-        key = self._cache_key(config)
-        now = time.monotonic()
-
-        async with self._lock:
-            if key in self._cache:
-                ts, api = self._cache[key]
-                if now - ts < self._ttl:
-                    logger.debug(
-                        "Reusing cached Zabbix API session for %s", config.zabbix_url
-                    )
-                    return api
-                else:
-                    await self._evict(key)
-
-            if len(self._cache) >= self._max_size:
-                await self._evict_oldest()
-
-        api: Any = AsyncZabbixAPI(
-            url=config.zabbix_url,
-            token=config.token,
-            user=config.user,
-            password=config.password,
-            validate_certs=config.verify_ssl,
-            timeout=config.timeout,
-            skip_version_check=config.skip_version_check,
-        )
-        await api.login()
-
-        async with self._lock:
-            self._cache[key] = (now, api)
-
-        return api
-
-    async def invalidate(self, config: ZabbixConfig) -> None:
-        key = self._cache_key(config)
-        async with self._lock:
-            if key in self._cache:
-                logger.info(
-                    "Invalidating cached Zabbix API session for %s",
-                    config.zabbix_url,
-                )
-                await self._evict(key)
-
-    async def _evict(self, key: tuple[str, ...]) -> None:
-        if key in self._cache:
-            _, api = self._cache.pop(key)
-            try:
-                await api.logout()
-            except Exception:
-                logger.debug("Ignoring exception closing evicted session")
-
-    async def _evict_oldest(self) -> None:
-        if not self._cache:
-            return
-        oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
-        await self._evict(oldest_key)
-
-    async def close_all(self) -> None:
-        async with self._lock:
-            for key in list(self._cache):
-                _, api = self._cache[key]
-                try:
-                    await api.logout()
-                except Exception:
-                    logger.debug("Ignoring exception closing cached session")
-            self._cache.clear()
-
-
-_passthrough_cache: PassthroughClientCache | None = None
-
-
-def get_passthrough_cache(config: ZabbixConfig) -> PassthroughClientCache:
-    global _passthrough_cache
-    if _passthrough_cache is None:
-        _passthrough_cache = PassthroughClientCache(
-            max_size=config.passthrough_cache_size,
-            ttl=config.passthrough_cache_ttl,
-        )
-    return _passthrough_cache
-
-
 def extract_zabbix_config_from_request(
     request: Any, default_config: ZabbixConfig | None = None
 ) -> ZabbixConfig:
@@ -206,8 +106,6 @@ def extract_zabbix_config_from_request(
         rate_limit_max_requests=base.rate_limit_max_requests if base else 60,
         rate_limit_window_minutes=base.rate_limit_window_minutes if base else 1,
         passthrough_enabled=True,
-        passthrough_cache_size=base.passthrough_cache_size if base else 50,
-        passthrough_cache_ttl=base.passthrough_cache_ttl if base else 300,
         tool_search_enabled=base.tool_search_enabled if base else False,
         tool_search_strategy=base.tool_search_strategy if base else "bm25",
         tool_search_max_results=base.tool_search_max_results if base else 5,
@@ -238,8 +136,6 @@ def get_zabbix_config_from_env() -> ZabbixConfig:
         rate_limit_max_requests=int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "60")),
         rate_limit_window_minutes=int(os.getenv("RATE_LIMIT_WINDOW_MINUTES", "1")),
         passthrough_enabled=parse_bool(os.getenv("ZABBIX_PASSTHROUGH"), default=False),
-        passthrough_cache_size=int(os.getenv("ZABBIX_PASSTHROUGH_CACHE_SIZE", "50")),
-        passthrough_cache_ttl=int(os.getenv("ZABBIX_PASSTHROUGH_CACHE_TTL", "300")),
         tool_search_enabled=parse_bool(os.getenv("TOOL_SEARCH_ENABLED"), default=False),
         tool_search_strategy=(
             "regex"
