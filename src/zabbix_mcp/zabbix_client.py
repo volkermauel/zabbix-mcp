@@ -128,6 +128,16 @@ class PassthroughClientCache:
 
         return api
 
+    async def invalidate(self, config: ZabbixConfig) -> None:
+        key = self._cache_key(config)
+        async with self._lock:
+            if key in self._cache:
+                logger.info(
+                    "Invalidating cached Zabbix API session for %s",
+                    config.zabbix_url,
+                )
+                await self._evict(key)
+
     async def _evict(self, key: tuple[str, ...]) -> None:
         if key in self._cache:
             _, api = self._cache.pop(key)

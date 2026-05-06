@@ -11,6 +11,8 @@ from typing import Any
 from fastmcp import Context
 from fastmcp.server.dependencies import get_http_request
 from pydantic import Field
+from zabbix_utils.exceptions import APIRequestError
+from zabbix_utils.exceptions import ProcessingError
 
 from zabbix_mcp.models import ZabbixConfig
 from zabbix_mcp.zabbix_client import ZabbixClient
@@ -18,6 +20,56 @@ from zabbix_mcp.zabbix_client import extract_zabbix_config_from_request
 from zabbix_mcp.zabbix_client import get_passthrough_cache
 
 logger = logging.getLogger(__name__)
+
+_AUTH_ERROR_CODES = {-32602, -32500}
+_SESSION_ERROR_SUBSTRINGS = (
+    "session expired",
+    "session is closed",
+    "not authenticated",
+    "not authorized",
+    "session terminated",
+    "re-login",
+)
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    if not isinstance(exc, APIRequestError):
+        return False
+    err = exc.args[0] if exc.args else {}
+    if not isinstance(err, dict):
+        return False
+    if err.get("code", 0) in _AUTH_ERROR_CODES:
+        return True
+    combined = (str(err.get("message", "")) + " " + str(err.get("data", ""))).lower()
+    return any(s in combined for s in _SESSION_ERROR_SUBSTRINGS)
+
+
+def format_error(exc: Exception) -> dict:
+    if isinstance(exc, APIRequestError):
+        err = exc.args[0] if exc.args else {}
+        if isinstance(err, dict):
+            code = err.get("code")
+            message = err.get("message", str(exc))
+            data = err.get("data", "")
+            hint = ""
+            if _is_auth_error(exc):
+                hint = "Session expired. Retry the request to auto-refresh."
+            elif code == -32602:
+                hint = "Invalid parameters. Check parameter names and types."
+            return {
+                "error": {"code": code, "message": message, "data": data, "hint": hint}
+            }
+        return {"error": {"code": None, "message": str(exc), "data": "", "hint": ""}}
+    if isinstance(exc, ProcessingError):
+        return {
+            "error": {
+                "code": None,
+                "message": str(exc),
+                "data": "",
+                "hint": "Connection or processing error. Check Zabbix server URL and network connectivity.",
+            }
+        }
+    return {"error": {"code": None, "message": str(exc), "data": "", "hint": ""}}
 
 
 def register_tools(mcp, config: ZabbixConfig):
@@ -37,7 +89,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 ):
                     cache = get_passthrough_cache(config)
                     api = await cache.get_or_create(passthrough_config)
-                    return _PassthroughApi(api)
+                    return _PassthroughApi(api, cache, passthrough_config)
             except Exception:
                 logger.warning(
                     "Failed to create passthrough session, falling back to default config"
@@ -47,13 +99,23 @@ def register_tools(mcp, config: ZabbixConfig):
     class _PassthroughApi:
         """Context manager wrapper for cached passthrough API sessions."""
 
-        def __init__(self, api):
+        def __init__(self, api, cache=None, config=None):
             self._api = api
+            self._cache = cache
+            self._config = config
 
         async def __aenter__(self):
             return self._api
 
-        async def __aexit__(self, *args):
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if (
+                exc_val is not None
+                and _is_auth_error(exc_val)
+                and self._cache is not None
+                and self._config is not None
+            ):
+                logger.info("Auth error detected, invalidating passthrough cache entry")
+                await self._cache.invalidate(self._config)
             return False
 
     ##########################
@@ -90,7 +152,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"version": version}
         except Exception as e:
             await ctx.error(f"Error getting API version: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Host Tools
@@ -140,10 +202,25 @@ def register_tools(mcp, config: ZabbixConfig):
                 description="Output format: 'extend' or specific fields.",
             ),
         ] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         limit: Annotated[
             int | None,
             Field(default=None, description="Maximum number of results.", ge=1),
         ] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(default=None, description="Field to sort by (e.g., 'host', 'name')."),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="ASC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "ASC",
     ) -> dict:
         """
         Get hosts from Zabbix with optional filtering.
@@ -194,10 +271,15 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["proxyids"] = proxyids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.host.get(**params)
@@ -205,7 +287,79 @@ def register_tools(mcp, config: ZabbixConfig):
 
         except Exception as e:
             await ctx.error(f"Error retrieving hosts: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
+
+    @mcp.tool(
+        tags={"zabbix", "host", "read-only"},
+        annotations={
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+        },
+    )
+    async def resolve_host(
+        ctx: Context,
+        name: Annotated[
+            str,
+            Field(
+                description="Hostname or pattern to resolve. Supports Zabbix LIKE matching (e.g. 'web-server-01')."
+            ),
+        ],
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in the name parameter.",
+            ),
+        ] = False,
+        limit: Annotated[
+            int | None,
+            Field(
+                default=10,
+                ge=1,
+                description="Maximum number of matches to return.",
+            ),
+        ] = 10,
+    ) -> dict:
+        """
+        Resolve a hostname to its Zabbix host ID and basic info.
+
+        Convenience tool that searches for a host and returns only the essential
+        fields needed for subsequent API calls: hostid, host, name, and status.
+
+        Args:
+            name: Hostname or pattern to search for.
+            search_wildcards_enabled: Enable wildcard matching with * and _ characters.
+            limit: Maximum number of matches to return (default 10).
+
+        Returns:
+            dict: Contains 'hosts' list with hostid, host, name, and status fields,
+                  plus 'count' of matches found.
+
+        Example response:
+            {
+                "hosts": [
+                    {"hostid": "10001", "host": "web-server-01", "name": "Web Server 01", "status": "0"}
+                ],
+                "count": 1
+            }
+        """
+        try:
+            await ctx.info(f"Resolving host: {name}")
+            params: dict[str, Any] = {
+                "output": ["hostid", "host", "name", "status"],
+                "search": {"host": name},
+                "limit": limit,
+            }
+            if search_wildcards_enabled:
+                params["searchWildcardsEnabled"] = True
+
+            async with await _get_api(ctx) as api:
+                result = await api.host.get(**params)
+                return {"hosts": result, "count": len(result)}
+        except Exception as e:
+            await ctx.error(f"Error resolving host: {e!s}")
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "host"},
@@ -289,7 +443,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating host: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "host"},
@@ -356,7 +510,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating host: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "host"},
@@ -399,7 +553,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting hosts: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Host Group Tools
@@ -424,6 +578,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[
             dict[str, str] | None, Field(default=None, description="Search.")
         ] = None,
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         output: Annotated[
             str, Field(default="extend", description="Output format.")
         ] = "extend",
@@ -468,13 +629,15 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["hostids"] = hostids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
 
             async with await _get_api(ctx) as api:
                 result = await api.hostgroup.get(**params)
                 return {"groups": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving host groups: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "hostgroup"},
@@ -517,7 +680,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating host group: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "hostgroup"},
@@ -563,7 +726,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating host group: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "hostgroup"},
@@ -606,7 +769,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting host groups: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Template Tools
@@ -626,6 +789,13 @@ def register_tools(mcp, config: ZabbixConfig):
         groupids: Annotated[list[str] | None, Field(default=None)] = None,
         hostids: Annotated[list[str] | None, Field(default=None)] = None,
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         output: Annotated[str, Field(default="extend")] = "extend",
     ) -> dict:
         """
@@ -669,13 +839,15 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["hostids"] = hostids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
 
             async with await _get_api(ctx) as api:
                 result = await api.template.get(**params)
                 return {"templates": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving templates: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "template"},
@@ -731,7 +903,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating template: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "template"},
@@ -781,7 +953,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating template: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "template"},
@@ -825,7 +997,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting templates: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Item Tools
@@ -848,7 +1020,22 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(default=None, description="Field to sort by (e.g., 'name', 'key_')."),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="ASC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "ASC",
     ) -> dict:
         """
         Get items (metrics) from Zabbix.
@@ -907,17 +1094,22 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["templateids"] = templateids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.item.get(**params)
                 return {"items": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving items: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "item"},
@@ -1004,7 +1196,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating item: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "item"},
@@ -1069,7 +1261,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating item: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "item"},
@@ -1112,7 +1304,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting items: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Trigger Tools
@@ -1135,7 +1327,25 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description="Field to sort by (e.g., 'priority', 'lastchange').",
+            ),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="ASC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "ASC",
         only_true: Annotated[
             bool,
             Field(default=False, description="Only return triggers in problem state."),
@@ -1202,10 +1412,15 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["templateids"] = templateids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
             if only_true:
                 params["only_true"] = only_true
             if min_severity is not None:
@@ -1216,7 +1431,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"triggers": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving triggers: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "trigger"},
@@ -1281,7 +1496,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating trigger: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "trigger"},
@@ -1346,7 +1561,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating trigger: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "trigger"},
@@ -1389,7 +1604,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting triggers: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Problem Tools
@@ -1421,6 +1636,17 @@ def register_tools(mcp, config: ZabbixConfig):
         ] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description="Field to sort by (e.g., 'eventid', 'clock').",
+            ),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="DESC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "DESC",
     ) -> dict:
         """
         Get problems from Zabbix.
@@ -1485,13 +1711,16 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["severities"] = severities
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.problem.get(**params)
                 return {"problems": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving problems: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ###########################
     # Event Tools
@@ -1515,6 +1744,17 @@ def register_tools(mcp, config: ZabbixConfig):
         time_till: Annotated[int | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description="Field to sort by (e.g., 'eventid', 'clock').",
+            ),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="DESC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "DESC",
     ) -> dict:
         """
         Get events from Zabbix.
@@ -1575,13 +1815,16 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["time_till"] = time_till
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.event.get(**params)
                 return {"events": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving events: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "event"},
@@ -1638,7 +1881,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"eventids": result.get("eventids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error acknowledging events: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # History Tools
@@ -1731,7 +1974,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"history": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving history: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "trend", "read-only"},
@@ -1747,6 +1990,14 @@ def register_tools(mcp, config: ZabbixConfig):
         time_from: Annotated[int | None, Field(default=None)] = None,
         time_till: Annotated[int | None, Field(default=None)] = None,
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(default=None, description="Field to sort by (e.g., 'clock')."),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="DESC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "DESC",
     ) -> dict:
         """
         Get trend data from Zabbix.
@@ -1799,13 +2050,16 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["time_till"] = time_till
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.trend.get(**params)
                 return {"trends": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving trends: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # User Tools
@@ -1823,6 +2077,13 @@ def register_tools(mcp, config: ZabbixConfig):
         ctx: Context,
         userids: Annotated[list[str] | None, Field(default=None)] = None,
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
     ) -> dict:
@@ -1865,6 +2126,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["userids"] = userids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -1873,7 +2136,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"users": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving users: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "user"},
@@ -1936,7 +2199,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating user: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "user"},
@@ -2004,7 +2267,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating user: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "user"},
@@ -2047,7 +2310,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting users: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Proxy Tools
@@ -2067,7 +2330,22 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
+        sortfield: Annotated[
+            str | None,
+            Field(default=None, description="Field to sort by (e.g., 'host')."),
+        ] = None,
+        sortorder: Annotated[
+            str,
+            Field(default="ASC", description="Sort direction: 'ASC' or 'DESC'."),
+        ] = "ASC",
     ) -> dict:
         """
         Get proxies from Zabbix.
@@ -2107,17 +2385,22 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["proxyids"] = proxyids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
             if limit:
                 params["limit"] = limit
+            if sortfield:
+                params["sortfield"] = sortfield
+                params["sortorder"] = sortorder
 
             async with await _get_api(ctx) as api:
                 result = await api.proxy.get(**params)
                 return {"proxies": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving proxies: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "proxy"},
@@ -2171,7 +2454,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating proxy: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "proxy"},
@@ -2227,7 +2510,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error updating proxy: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "proxy"},
@@ -2270,7 +2553,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting proxies: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Proxy Tools
@@ -2341,7 +2624,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"maintenance": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving maintenance: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "maintenance"},
@@ -2435,7 +2718,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 }
         except Exception as e:
             await ctx.error(f"Error creating maintenance: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "maintenance"},
@@ -2498,7 +2781,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 }
         except Exception as e:
             await ctx.error(f"Error updating maintenance: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "maintenance"},
@@ -2546,7 +2829,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 }
         except Exception as e:
             await ctx.error(f"Error deleting maintenance: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Action Tools
@@ -2568,6 +2851,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get actions from Zabbix.
@@ -2612,6 +2902,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["hostids"] = hostids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2620,7 +2912,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"actions": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving actions: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Media Type Tools
@@ -2640,6 +2932,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get media types from Zabbix.
@@ -2677,6 +2976,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["mediatypeids"] = mediatypeids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2685,7 +2986,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"mediatypes": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving media types: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Graph Tools
@@ -2707,6 +3008,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get graphs from Zabbix.
@@ -2750,6 +3058,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["templateids"] = templateids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2758,7 +3068,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"graphs": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving graphs: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # Discovery Tools
@@ -2780,6 +3090,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get discovery rules from Zabbix.
@@ -2824,6 +3141,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["templateids"] = templateids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2832,7 +3151,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"discoveryrules": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving discovery rules: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "itemprototype", "read-only"},
@@ -2850,6 +3169,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get item prototypes from Zabbix.
@@ -2894,6 +3220,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["discoveryids"] = discoveryids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2902,7 +3230,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"itemprototypes": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving item prototypes: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "drule", "read-only"},
@@ -2918,6 +3246,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get network discovery rules from Zabbix.
@@ -2955,6 +3290,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["druleids"] = druleids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -2963,7 +3300,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"drules": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving network discovery rules: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "configuration", "read-only"},
@@ -3030,7 +3367,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"content": result, "success": True}
         except Exception as e:
             await ctx.error(f"Error exporting configuration: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "configuration"},
@@ -3083,7 +3420,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"result": result, "success": True}
         except Exception as e:
             await ctx.error(f"Error importing configuration: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # SLA Tools
@@ -3104,6 +3441,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get SLAs from Zabbix.
@@ -3145,6 +3489,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["serviceids"] = serviceids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -3153,7 +3499,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"slas": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving SLAs: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "service", "read-only"},
@@ -3170,6 +3516,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get services from Zabbix.
@@ -3210,6 +3563,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["parentids"] = parentids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -3218,7 +3573,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"services": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving services: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ###########################
     # Script Tools
@@ -3240,6 +3595,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get scripts from Zabbix.
@@ -3283,6 +3645,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["groupids"] = groupids
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -3291,7 +3655,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"scripts": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving scripts: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "script"},
@@ -3336,7 +3700,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"result": result, "success": True}
         except Exception as e:
             await ctx.error(f"Error executing script: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     ##########################
     # User Macro Tools
@@ -3362,6 +3726,13 @@ def register_tools(mcp, config: ZabbixConfig):
         search: Annotated[dict[str, str] | None, Field(default=None)] = None,
         filter_params: Annotated[dict[str, Any] | None, Field(default=None)] = None,
         output: Annotated[str, Field(default="extend")] = "extend",
+        search_wildcards_enabled: Annotated[
+            bool,
+            Field(
+                default=False,
+                description="Enable wildcard matching with * and _ in search values.",
+            ),
+        ] = False,
     ) -> dict:
         """
         Get user macros from Zabbix.
@@ -3412,6 +3783,8 @@ def register_tools(mcp, config: ZabbixConfig):
                 params["globalmacro"] = globalmacro
             if search:
                 params["search"] = search
+                if search_wildcards_enabled:
+                    params["searchWildcardsEnabled"] = True
             if filter_params:
                 params["filter"] = filter_params
 
@@ -3420,7 +3793,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"macros": result, "count": len(result)}
         except Exception as e:
             await ctx.error(f"Error retrieving user macros: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "usermacro"},
@@ -3485,7 +3858,7 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"hostmacroids": result.get("hostmacroids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error creating macro: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
 
     @mcp.tool(
         tags={"zabbix", "usermacro"},
@@ -3529,4 +3902,4 @@ def register_tools(mcp, config: ZabbixConfig):
                 return {"hostmacroids": result.get("hostmacroids", []), "success": True}
         except Exception as e:
             await ctx.error(f"Error deleting macros: {e!s}")
-            return {"error": str(e)}
+            return format_error(e)
