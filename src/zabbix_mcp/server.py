@@ -133,24 +133,44 @@ if getattr(ZABBIX_CONFIG, "rate_limit_enabled", False):
 
 
 def main():
-    # Basic validation - need either token OR user/password
-    has_token = bool(ZABBIX_CONFIG.token)
-    has_user_pass = bool(ZABBIX_CONFIG.user and ZABBIX_CONFIG.password)
+    passthrough = ZABBIX_CONFIG.passthrough_enabled
+    is_http = TRANSPORT_CONFIG.transport_type in ("sse", "http")
 
-    if not ZABBIX_CONFIG.zabbix_url:
-        logger.error("Missing required Zabbix URL (ZABBIX_URL). Check your .env file.")
-        raise SystemExit(1)
-
-    if not has_token and not has_user_pass:
+    if passthrough and not is_http:
         logger.error(
-            "Missing Zabbix authentication. Provide either ZABBIX_TOKEN or both ZABBIX_USER and ZABBIX_PASSWORD."
+            "ZABBIX_PASSTHROUGH=true requires HTTP or SSE transport. "
+            "Set MCP_TRANSPORT=http or MCP_TRANSPORT=sse."
         )
         raise SystemExit(1)
 
-    auth_method = "token" if has_token else "user/password"
-    logger.info(
-        f"Starting Zabbix MCP Server connecting to {ZABBIX_CONFIG.zabbix_url} (auth: {auth_method})..."
-    )
+    if passthrough:
+        logger.info(
+            "Passthrough authentication enabled - credentials from X-Zabbix-* headers"
+        )
+
+    has_token = bool(ZABBIX_CONFIG.token)
+    has_user_pass = bool(ZABBIX_CONFIG.user and ZABBIX_CONFIG.password)
+    has_default_creds = bool(ZABBIX_CONFIG.zabbix_url and (has_token or has_user_pass))
+
+    if not passthrough:
+        if not ZABBIX_CONFIG.zabbix_url:
+            logger.error(
+                "Missing required Zabbix URL (ZABBIX_URL). Check your .env file."
+            )
+            raise SystemExit(1)
+        if not has_token and not has_user_pass:
+            logger.error(
+                "Missing Zabbix authentication. Provide either ZABBIX_TOKEN or both ZABBIX_USER and ZABBIX_PASSWORD."
+            )
+            raise SystemExit(1)
+
+    if has_default_creds:
+        auth_method = "token" if has_token else "user/password"
+        logger.info(f"Default Zabbix: {ZABBIX_CONFIG.zabbix_url} (auth: {auth_method})")
+    elif passthrough:
+        logger.info(
+            "No default Zabbix credentials - all requests require X-Zabbix-* headers"
+        )
 
     # Choose transport based on configuration
     if TRANSPORT_CONFIG.transport_type == "sse":

@@ -4,6 +4,7 @@ Zabbix MCP Server Tools
 This module provides tools for interacting with the Zabbix API through the MCP server.
 """
 
+import logging
 from typing import Annotated
 from typing import Any
 
@@ -12,10 +13,47 @@ from pydantic import Field
 
 from zabbix_mcp.models import ZabbixConfig
 from zabbix_mcp.zabbix_client import ZabbixClient
+from zabbix_mcp.zabbix_client import extract_zabbix_config_from_request
+from zabbix_mcp.zabbix_client import get_passthrough_cache
+
+logger = logging.getLogger(__name__)
 
 
 def register_tools(mcp, config: ZabbixConfig):
     """Register Zabbix tools with the MCP server"""
+
+    async def _get_api(ctx: Context):
+        """Get an authenticated Zabbix API instance, using passthrough headers or default config."""
+        if not config.passthrough_enabled:
+            return ZabbixClient(config)
+        request = ctx.get_http_request()
+        if request is not None:
+            try:
+                passthrough_config = extract_zabbix_config_from_request(request, config)
+                if (
+                    passthrough_config.zabbix_url != config.zabbix_url
+                    or passthrough_config.token != config.token
+                ):
+                    cache = get_passthrough_cache(config)
+                    api = await cache.get_or_create(passthrough_config)
+                    return _PassthroughApi(api)
+            except Exception:
+                logger.warning(
+                    "Failed to create passthrough session, falling back to default config"
+                )
+        return ZabbixClient(config)
+
+    class _PassthroughApi:
+        """Context manager wrapper for cached passthrough API sessions."""
+
+        def __init__(self, api):
+            self._api = api
+
+        async def __aenter__(self):
+            return self._api
+
+        async def __aexit__(self, *args):
+            return False
 
     ##########################
     # API Info Tools
@@ -46,7 +84,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info("Getting Zabbix API version...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 version = str(api.version)
                 return {"version": version}
         except Exception as e:
@@ -160,7 +198,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.host.get(**params)
                 return {"hosts": result, "count": len(result)}
 
@@ -245,7 +283,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.host.create(**params)
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
@@ -312,7 +350,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.host.update(**params)
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
@@ -355,7 +393,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting hosts: {hostids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.host.delete(*hostids)
                 return {"hostids": result.get("hostids", []), "success": True}
         except Exception as e:
@@ -430,7 +468,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if search:
                 params["search"] = search
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.hostgroup.get(**params)
                 return {"groups": result, "count": len(result)}
         except Exception as e:
@@ -473,7 +511,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Creating host group '{name}'...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.hostgroup.create(name=name)
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
@@ -519,7 +557,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if name is not None:
                 params["name"] = name
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.hostgroup.update(**params)
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
@@ -562,7 +600,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting host groups: {groupids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.hostgroup.delete(*groupids)
                 return {"groupids": result.get("groupids", []), "success": True}
         except Exception as e:
@@ -631,7 +669,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if search:
                 params["search"] = search
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.template.get(**params)
                 return {"templates": result, "count": len(result)}
         except Exception as e:
@@ -687,7 +725,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.template.create(**params)
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
@@ -737,7 +775,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description is not None:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.template.update(**params)
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
@@ -781,7 +819,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting templates: {templateids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.template.delete(*templateids)
                 return {"templateids": result.get("templateids", []), "success": True}
         except Exception as e:
@@ -873,7 +911,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.item.get(**params)
                 return {"items": result, "count": len(result)}
         except Exception as e:
@@ -960,7 +998,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.item.create(**params)
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
@@ -1025,7 +1063,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if status is not None:
                 params["status"] = status
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.item.update(**params)
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
@@ -1068,7 +1106,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting items: {itemids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.item.delete(*itemids)
                 return {"itemids": result.get("itemids", []), "success": True}
         except Exception as e:
@@ -1172,7 +1210,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if min_severity is not None:
                 params["min_severity"] = min_severity
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.trigger.get(**params)
                 return {"triggers": result, "count": len(result)}
         except Exception as e:
@@ -1237,7 +1275,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if comments:
                 params["comments"] = comments
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.trigger.create(**params)
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
@@ -1302,7 +1340,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if comments is not None:
                 params["comments"] = comments
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.trigger.update(**params)
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
@@ -1345,7 +1383,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting triggers: {triggerids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.trigger.delete(*triggerids)
                 return {"triggerids": result.get("triggerids", []), "success": True}
         except Exception as e:
@@ -1447,7 +1485,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.problem.get(**params)
                 return {"problems": result, "count": len(result)}
         except Exception as e:
@@ -1537,7 +1575,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.event.get(**params)
                 return {"events": result, "count": len(result)}
         except Exception as e:
@@ -1594,7 +1632,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if message:
                 params["message"] = message
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.event.acknowledge(**params)
                 return {"eventids": result.get("eventids", []), "success": True}
         except Exception as e:
@@ -1687,7 +1725,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.history.get(**params)
                 return {"history": result, "count": len(result)}
         except Exception as e:
@@ -1761,7 +1799,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.trend.get(**params)
                 return {"trends": result, "count": len(result)}
         except Exception as e:
@@ -1829,7 +1867,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.user.get(**params)
                 return {"users": result, "count": len(result)}
         except Exception as e:
@@ -1892,7 +1930,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if surname:
                 params["surname"] = surname
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.user.create(**params)
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
@@ -1960,7 +1998,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if type_ is not None:
                 params["type"] = type_
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.user.update(**params)
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
@@ -2003,7 +2041,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting users: {userids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.user.delete(*userids)
                 return {"userids": result.get("userids", []), "success": True}
         except Exception as e:
@@ -2073,7 +2111,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if limit:
                 params["limit"] = limit
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.proxy.get(**params)
                 return {"proxies": result, "count": len(result)}
         except Exception as e:
@@ -2127,7 +2165,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.proxy.create(**params)
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
@@ -2183,7 +2221,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description is not None:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.proxy.update(**params)
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
@@ -2226,7 +2264,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting proxies: {proxyids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.proxy.delete(*proxyids)
                 return {"proxyids": result.get("proxyids", []), "success": True}
         except Exception as e:
@@ -2297,7 +2335,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if hostids:
                 params["hostids"] = hostids
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.maintenance.get(**params)
                 return {"maintenance": result, "count": len(result)}
         except Exception as e:
@@ -2388,7 +2426,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.maintenance.create(**params)
                 return {
                     "maintenanceids": result.get("maintenanceids", []),
@@ -2451,7 +2489,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description is not None:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.maintenance.update(**params)
                 return {
                     "maintenanceids": result.get("maintenanceids", []),
@@ -2499,7 +2537,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting maintenance: {maintenanceids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.maintenance.delete(*maintenanceids)
                 return {
                     "maintenanceids": result.get("maintenanceids", []),
@@ -2576,7 +2614,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.action.get(**params)
                 return {"actions": result, "count": len(result)}
         except Exception as e:
@@ -2641,7 +2679,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.mediatype.get(**params)
                 return {"mediatypes": result, "count": len(result)}
         except Exception as e:
@@ -2714,7 +2752,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.graph.get(**params)
                 return {"graphs": result, "count": len(result)}
         except Exception as e:
@@ -2788,7 +2826,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.discoveryrule.get(**params)
                 return {"discoveryrules": result, "count": len(result)}
         except Exception as e:
@@ -2858,7 +2896,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.itemprototype.get(**params)
                 return {"itemprototypes": result, "count": len(result)}
         except Exception as e:
@@ -2919,7 +2957,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.drule.get(**params)
                 return {"drules": result, "count": len(result)}
         except Exception as e:
@@ -2986,7 +3024,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if groupids:
                 params["groupids"] = groupids
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.configuration.export(**params)
                 return {"content": result, "success": True}
         except Exception as e:
@@ -3039,7 +3077,7 @@ def register_tools(mcp, config: ZabbixConfig):
             await ctx.info("Importing configuration...")
             params: dict[str, Any] = {"format": format_type, "source": content}
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.configuration.import_config(**params)
                 return {"result": result, "success": True}
         except Exception as e:
@@ -3109,7 +3147,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.sla.get(**params)
                 return {"slas": result, "count": len(result)}
         except Exception as e:
@@ -3174,7 +3212,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.service.get(**params)
                 return {"services": result, "count": len(result)}
         except Exception as e:
@@ -3247,7 +3285,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.script.get(**params)
                 return {"scripts": result, "count": len(result)}
         except Exception as e:
@@ -3292,7 +3330,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Executing script {scriptid} on host {hostid}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.script.execute(scriptid=scriptid, hostid=hostid)
                 return {"result": result, "success": True}
         except Exception as e:
@@ -3376,7 +3414,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if filter_params:
                 params["filter"] = filter_params
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.usermacro.get(**params)
                 return {"macros": result, "count": len(result)}
         except Exception as e:
@@ -3441,7 +3479,7 @@ def register_tools(mcp, config: ZabbixConfig):
             if description:
                 params["description"] = description
 
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.usermacro.create(**params)
                 return {"hostmacroids": result.get("hostmacroids", []), "success": True}
         except Exception as e:
@@ -3485,7 +3523,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """
         try:
             await ctx.info(f"Deleting macros: {hostmacroids}...")
-            async with ZabbixClient(config) as api:
+            async with await _get_api(ctx) as api:
                 result = await api.usermacro.delete(*hostmacroids)
                 return {"hostmacroids": result.get("hostmacroids", []), "success": True}
         except Exception as e:
