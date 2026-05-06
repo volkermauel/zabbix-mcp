@@ -9,6 +9,7 @@ from typing import Annotated
 from typing import Any
 
 from fastmcp import Context
+from fastmcp.server.dependencies import get_http_request
 from pydantic import Field
 
 from zabbix_mcp.models import ZabbixConfig
@@ -26,7 +27,7 @@ def register_tools(mcp, config: ZabbixConfig):
         """Get an authenticated Zabbix API instance, using passthrough headers or default config."""
         if not config.passthrough_enabled:
             return ZabbixClient(config)
-        request = ctx.get_http_request()
+        request = get_http_request()
         if request is not None:
             try:
                 passthrough_config = extract_zabbix_config_from_request(request, config)
