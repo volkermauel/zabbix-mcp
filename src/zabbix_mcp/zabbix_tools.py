@@ -168,7 +168,10 @@ def register_tools(mcp, config: ZabbixConfig):
         ] = None,
         sortfield: Annotated[
             str | None,
-            Field(default=None, description="Field to sort by (e.g., 'host', 'name')."),
+            Field(
+                default=None,
+                description="Field to sort by. Valid values: 'clock'.",
+            ),
         ] = None,
         sortorder: Annotated[
             str,
@@ -983,7 +986,10 @@ def register_tools(mcp, config: ZabbixConfig):
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
         sortfield: Annotated[
             str | None,
-            Field(default=None, description="Field to sort by (e.g., 'name', 'key_')."),
+            Field(
+                default=None,
+                description="Field to sort by. Valid values: 'itemid', 'name', 'key_', 'delay', 'history', 'trends', 'type', 'status'.",
+            ),
         ] = None,
         sortorder: Annotated[
             str,
@@ -1292,7 +1298,7 @@ def register_tools(mcp, config: ZabbixConfig):
             str | None,
             Field(
                 default=None,
-                description="Field to sort by (e.g., 'priority', 'lastchange').",
+                description="Field to sort by. Valid values: 'triggerid', 'description', 'status', 'priority', 'lastchange'.",
             ),
         ] = None,
         sortorder: Annotated[
@@ -1593,7 +1599,7 @@ def register_tools(mcp, config: ZabbixConfig):
             str | None,
             Field(
                 default=None,
-                description="Field to sort by (e.g., 'eventid', 'clock').",
+                description="Field to sort by. Only valid value: 'eventid'.",
             ),
         ] = None,
         sortorder: Annotated[
@@ -1701,7 +1707,7 @@ def register_tools(mcp, config: ZabbixConfig):
             str | None,
             Field(
                 default=None,
-                description="Field to sort by (e.g., 'eventid', 'clock').",
+                description="Field to sort by. Only valid value: 'eventid'.",
             ),
         ] = None,
         sortorder: Annotated[
@@ -2293,7 +2299,10 @@ def register_tools(mcp, config: ZabbixConfig):
         limit: Annotated[int | None, Field(default=None, ge=1)] = None,
         sortfield: Annotated[
             str | None,
-            Field(default=None, description="Field to sort by (e.g., 'host')."),
+            Field(
+                default=None,
+                description="Field to sort by. Valid values: 'proxyid', 'host', 'status', 'lastaccess'.",
+            ),
         ] = None,
         sortorder: Annotated[
             str,
